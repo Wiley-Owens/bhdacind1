@@ -15,6 +15,7 @@ from sklearn.linear_model import LogisticRegression
 
 R = 2025
 import os
+import joblib
 script_dir = os.path.dirname(__file__)
 csv_path = os.path.abspath(os.path.join(script_dir, '..', 'nfldata.csv'))
 
@@ -53,6 +54,21 @@ if cat_features:
     X = pd.concat([X, pd.get_dummies(df[cat_features], prefix=cat_features, dummy_na=False)], axis=1)
 
 y = df['fourth_down_converted'].astype(int)
+
+# If a features file exists (saved by our training pipeline / selection script), prefer that ordering
+features_file = os.path.join(script_dir, 'models', 'features.joblib')
+if os.path.exists(features_file):
+    try:
+        user_features = joblib.load(features_file)
+        # Ensure the feature columns requested are present in X — otherwise fall back to the full set
+        present = [f for f in user_features if f in X.columns]
+        if len(present) > 0:
+            X = X[present].copy()
+            print('Using saved features list from models/features.joblib —', len(present), 'features')
+        else:
+            print('Saved feature list found but none of the features are present in the current dataset; using full prepared matrix.')
+    except Exception as exc:
+        print('Unable to load models/features.joblib — using full feature matrix:', exc)
 
 print('Prepared rows', len(X), 'features', X.shape[1])
 

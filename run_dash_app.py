@@ -17,6 +17,7 @@ import numpy as np
 from pathlib import Path
 
 import plotly.express as px
+import plotly.graph_objects as go
 
 BASE = Path(__file__).resolve().parent
 MODEL_PATH = BASE / 'models' / 'final_model.joblib'
@@ -51,9 +52,47 @@ X_vis = df[base_features].copy()
 if cat_features:
     X_vis = pd.concat([X_vis, pd.get_dummies(df[cat_features], prefix=cat_features, dummy_na=False)], axis=1)
 
-# Ensure alignment between columns used to train and those available for plotting
-feature_cols = X_vis.columns.tolist()
-X_vis = X_vis.fillna(0)
+# Align X_vis to the feature ordering the saved scaler/model expects.
+# Prefer the scaler's known feature names when available, otherwise fall back to the
+# saved models/features.joblib list (if present) or the derived columns from the dataset.
+expected_features = None
+try:
+    # StandardScaler and many sklearn estimators expose `feature_names_in_` after fit
+    expected_features = list(scaler.feature_names_in_)
+except Exception:
+    expected_features = None
+
+features_file = BASE / 'models' / 'features.joblib'
+if expected_features is not None:
+    # Ensure every expected feature exists in X_vis; if missing, add a zero column so transform won't error
+    for f in expected_features:
+        if f not in X_vis.columns:
+            X_vis[f] = 0
+    # Reorder to the expected feature ordering and fill any remaining NA values
+    X_vis = X_vis[expected_features].fillna(0)
+    feature_cols = expected_features
+    print('Aligned dashboard input to scaler.feature_names_in_ (used for model/scaler).')
+else:
+    # No explicit expected feature ordering from scaler; fall back to saved file or derived columns
+    if features_file.exists():
+        try:
+            saved_features = joblib.load(features_file)
+            present = [f for f in saved_features if f in X_vis.columns]
+            if len(present) > 0:
+                feature_cols = present
+                X_vis = X_vis[feature_cols].copy()
+                print('Using saved feature list from models/features.joblib')
+            else:
+                feature_cols = X_vis.columns.tolist()
+                X_vis = X_vis.fillna(0)
+                print('Saved feature list found but features missing in dataset; using derived features instead')
+        except Exception:
+            feature_cols = X_vis.columns.tolist()
+            X_vis = X_vis.fillna(0)
+            print('Unable to load models/features.joblib; using derived features')
+    else:
+        feature_cols = X_vis.columns.tolist()
+        X_vis = X_vis.fillna(0)
 
 # compute probabilities using the saved scaler + model
 X_scaled_vis = scaler.transform(X_vis)
@@ -77,15 +116,60 @@ variable_descriptions = {
     'pass_location': 'Pass target location (categorical): left / middle / right / NA.'
 }
 
-# --- New: aggregate by yardline and compute mean conversion probability per yardline ---
-# We aggregate on yardline_100 and compute average predicted probability for each yardline. This
-# creates the data needed for the requested bar chart showing probability by yard line.
+# --- Aggregate by game_seconds_remaining and compute mean predicted probability ---
+# We aggregate on game_seconds_remaining and compute average predicted probability for each time bucket.
+if 'game_seconds_remaining' in df.columns:
+    df_by_time = df.groupby('game_seconds_remaining', as_index=False)['pred_prob'].mean()
+    # Sort ascending by time for natural visualization (low time to high time)
+    df_by_time = df_by_time.sort_values('game_seconds_remaining')
+else:
+    df_by_time = None
+
+# Add a simple smoothing column using pandas rolling window so we do not require statsmodels
+if df_by_time is not None and 'pred_prob' in df_by_time.columns:
+    # Use a small centered rolling window to smooth the mean probabilities for plotting
+    df_by_time['smoothed'] = df_by_time['pred_prob'].rolling(window=5, min_periods=1, center=True).mean()
+else:
+    # Ensure variable exists even when data is missing
+    df_by_time = None
+
+# --- Also aggregate by yardline for secondary visualization ---
 if 'yardline_100' in df.columns:
     df_by_yardline = df.groupby('yardline_100', as_index=False)['pred_prob'].mean()
     # Sort ascending so viewers can read from opponent's endzone outward (1 = closest to opponent endzone)
     df_by_yardline = df_by_yardline.sort_values('yardline_100')
 else:
     df_by_yardline = None
+
+# Prepare a figure for time-vs-mean-probability that does not require statsmodels
+if df_by_time is not None:
+    try:
+        # Plot the smoothed mean probability as a single clean line (do not show raw points)
+        # We use px.line on the smoothed column — this removes markers and avoids statsmodels.
+        if 'smoothed' in df_by_time.columns:
+            fig_by_time = px.line(df_by_time, x='game_seconds_remaining', y='smoothed', labels={'game_seconds_remaining': 'Seconds Remaining', 'smoothed': 'Mean Predicted Probability'}, title='Mean predicted probability by game time')
+        else:
+            # fallback: plot the raw mean values as a line if smoothing wasn't applied
+            fig_by_time = px.line(df_by_time, x='game_seconds_remaining', y='pred_prob', labels={'game_seconds_remaining': 'Seconds Remaining', 'pred_prob': 'Mean Predicted Probability'}, title='Mean predicted probability by game time')
+
+        # Flip the x-axis so chart reads from most time remaining -> least time remaining (left -> right)
+        fig_by_time.update_xaxes(autorange='reversed')
+
+        # Add vertical lines to mark quarter boundaries at 2700, 1800, 900 seconds remaining.
+        quarter_lines = []
+        for seconds in (2700, 1800, 900):
+            quarter_lines.append(dict(
+                type='line', x0=seconds, x1=seconds, xref='x', yref='paper', y0=0, y1=1,
+                line=dict(color='gold', width=1, dash='dash')
+            ))
+        # Add them to the layout shapes and ensure y-axis fits [0,1]
+        fig_by_time.update_layout(shapes=quarter_lines)
+        fig_by_time.update_yaxes(range=[0, 1])
+    except Exception:
+        # if building the plot fails for any reason, fall back to an empty figure
+        fig_by_time = {}
+else:
+    fig_by_time = {}
 
 def create_app():
     """Create and return a Dash app instance.
@@ -153,7 +237,7 @@ def create_app():
             ], style={'width': '32%', 'padding': '18px', 'backgroundColor': '#ffffff', 'borderRadius': '8px', 'boxShadow': '0 2px 6px rgba(20,20,20,0.07)'}),
 
             html.Div([
-                dcc.Graph(id='prob_hist', figure=px.histogram(df, x='pred_prob', nbins=50, title='Predicted probability distribution (dataset)'), style={'height': '330px'}),
+                dcc.Graph(id='prob_by_time', figure=fig_by_time, style={'height': '330px'}),
                 dcc.Graph(id='prob_by_yardline', figure=(px.bar(df_by_yardline, x='yardline_100', y='pred_prob', labels={'yardline_100': 'Yardline (100-based)', 'pred_prob': 'Mean predicted probability'}, title='Mean predicted probability by yardline') if df_by_yardline is not None else {}), style={'height': '320px'}),
                 dcc.Graph(id='feature_coefs', style={'height': '420px'})
             ], style={'flex': '1'})
